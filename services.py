@@ -1,26 +1,48 @@
 import json
 import os
-
+import threading
 import requests
+from fastapi import HTTPException,status
 from openai import OpenAI, OpenAIError
 
-import tools
+import utils
+from firestore_service import FirestoreService
 
 
 class LLMService:
     client = None
     profanity_words = None
     open_library_api = None
+    fsService = None
 
     def __init__(self):
         try:
-            self.profanity_words = tools.load_bad_words()
+            self.fsService = FirestoreService()
+            self.profanity_words = utils.load_bad_words()
             self.open_library_api = os.getenv("OPEN_LIBRARY_API")
             self.client = OpenAI(api_key=os.getenv("OPEN_API_KEY"))
         except OpenAIError as e:
             print(f"Error initializing OpenAI client: {e}")
             raise e
 
+
+    def process_user_query(self, query: str):
+        search_terms = self.get_search_terms_from_llm(query)
+        print("search term is: ", search_terms)
+
+        # check in firestore
+        response = self.fsService.get_response(search_terms)
+        if response:
+            return response
+
+
+        books_data = utils.search_open_library(search_terms, limit=5)
+        if not books_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No books found matching your query."
+            )
+        return self.generate_natural_language_response(query, books_data, search_terms)
 
     def check_for_profanity(self, query: str) -> bool:
         return any(word in self.profanity_words for word in query.lower().split())
@@ -32,9 +54,8 @@ class LLMService:
         prompt = f"""
         Based on the following user query for a book, extract ONLY the most relevant keywords, genres, author names,
         or titles to use for a book search API. 
-        Ignore generic keywords like books,library,top,find,help,etc.
-        Return a concise, space-separated string of 1-4 keywords that would be most useful for a book search API.
-        DO NOT include unnecessary words
+        IGNORE generic keywords like books,library,top,find,help,strong,small,big etc.
+        ONLY GENERATE maximum of 4 keywords that are concise, space-separated that are more relevant for a book search API
         Return search terms that are more appropriate for open library search.
         Return these keywords in a single, space-separated string.
         
@@ -56,35 +77,7 @@ class LLMService:
             print(f"Error generating search terms from LLM: {e}")
             raise e
 
-    def search_open_library(self, search_terms: str, limit: int = 5):
-        params = {
-            "q": search_terms,
-            "lang": "en",
-            "limit": limit,
-            "fields":"key,title,author_name,first_publish_year,subject",
-        }
-        try:
-            url = self.open_library_api
-            response = requests.get(url, params=params, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-
-            ### formating the result
-            books_found = []
-            for book in data.get("docs", []):
-                books_found.append({
-                    "title": book.get("title", "n/a"),
-                    "author":", ".join(book.get("author_name", ["n/a"])),
-                    "published_year": book.get("first_publish_year", "n/a"),
-                    "subject": ", ".join(book.get("subject", ["n/a"])[:5]), # limit to first 5 subjects
-                })
-            return books_found
-        except requests.RequestException as e:
-            print(f"Error searching Open Library: {e}")
-            raise
-
-
-    def generate_natural_language_response(self, original_query: str, books_data: list):
+    def generate_natural_language_response(self, original_query: str, books_data: list, search_terms: str):
         if not self.client:
             raise ValueError("OpenAI client not initialized.")
 
@@ -133,21 +126,17 @@ class LLMService:
                 max_tokens = 500,
             )
             raw = response.choices[0].message.content
-            print(raw)
-            parsed = self.parse_llm_response(raw)
+            parsed = utils.parse_llm_response(raw)
+            threading.Thread(
+                target=self.fsService.store_response,
+                args=(search_terms, parsed),
+                daemon=True
+            ).start()
             return parsed
         except OpenAIError as e:
             print(f"Error generating natural language response: {e}")
             raise
 
-    def parse_llm_response(self, raw_response):
-        try:
-            response = json.loads(raw_response)
-            return response
-        except json.JSONDecodeError as e:
-            print(f"Error parsing LLM response: {e}")
-            return {
-                "greeting": "Sorry, there was an error processing the response.",
-                "books": [],
-                "conclusion": ""
-            }
+
+
+
